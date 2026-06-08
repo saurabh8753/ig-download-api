@@ -1,5 +1,4 @@
 import axios from "axios";
-import * as cheerio from "cheerio";
 
 export default async function handler(req, res) {
   try {
@@ -8,59 +7,72 @@ export default async function handler(req, res) {
     if (!url) {
       return res.status(400).json({
         status: false,
-        message: "Missing Terabox URL"
+        message: "No URL provided"
       });
     }
 
-    // Step 1: Open share page
-    const page = await axios.get(url, {
+    // Open share page
+    const response = await axios.get(url, {
       headers: {
         "User-Agent":
-          "Mozilla/5.0",
-        Cookie: `ndus=${process.env.NDUS_COOKIE}`
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+        "Cookie":
+          `ndus=${process.env.NDUS_COOKIE}`
       }
     });
 
-    const html = page.data;
+    const html = response.data;
 
-    // Step 2: Extract JS token
-    const jsTokenMatch = html.match(/%22jsToken%22%3A%22(.*?)%22/);
+    // Extract jsToken
+    const jsTokenMatch = html.match(/jsToken.*?%22(.*?)%22/);
 
-    const shortUrlMatch = url.match(/s\/(.*?)($|\?)/);
-
-    if (!jsTokenMatch || !shortUrlMatch) {
+    if (!jsTokenMatch) {
       return res.status(500).json({
         status: false,
-        message: "Failed to extract tokens"
+        message: "jsToken not found"
       });
     }
 
     const jsToken = jsTokenMatch[1];
-    const shorturl = shortUrlMatch[1];
 
-    // Step 3: Call TeraBox API
-    const api = await axios.get(
+    // Extract shorturl
+    const shortMatch =
+      url.match(/s\/(.*?)($|\?)/);
+
+    if (!shortMatch) {
+      return res.status(500).json({
+        status: false,
+        message: "Invalid Terabox URL"
+      });
+    }
+
+    const shorturl = shortMatch[1];
+
+    // API request
+    const apiResponse = await axios.get(
       "https://www.terabox.app/share/list",
       {
         params: {
           app_id: "250528",
-          jsToken,
           shorturl,
-          root: "1"
+          root: "1",
+          jsToken
         },
         headers: {
-          Cookie: `ndus=${process.env.NDUS_COOKIE}`,
-          "User-Agent": "Mozilla/5.0"
+          "User-Agent":
+            "Mozilla/5.0",
+          "Cookie":
+            `ndus=${process.env.NDUS_COOKIE}`
         }
       }
     );
 
-    const data = api.data;
+    const data = apiResponse.data;
 
     if (!data.list || !data.list.length) {
       return res.status(404).json({
         status: false,
-        message: "No files found"
+        message: "No file found"
       });
     }
 
@@ -68,17 +80,17 @@ export default async function handler(req, res) {
 
     return res.status(200).json({
       status: true,
-      filename: file.server_filename,
+      file_name: file.server_filename,
       size: file.size,
-      thumbnail: file.thumb || null,
-      stream_url: file.dlink,
-      download_url: file.dlink
+      thumbnail: file.thumb,
+      download_url: file.dlink,
+      stream_url: file.dlink
     });
 
-  } catch (err) {
+  } catch (e) {
     return res.status(500).json({
       status: false,
-      error: err.message
+      error: e.message
     });
   }
 }
