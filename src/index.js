@@ -170,17 +170,39 @@ function formatSingle(item) {
 }
 
 async function scrapeEmbed(shortcode) {
-  const embedUrl = `https://www.instagram.com/p/${shortcode}/embed/captioned/`;
-  const res = await fetch(embedUrl, {
-    headers: { "User-Agent": UA_WEB, "Accept-Language": "en-US,en;q=0.9" },
-  });
-  if (!res.ok) throw new Error(`instagram embed responded with ${res.status}`);
+  // Try /p/ and /reel/ embed paths — reels sometimes only resolve under /reel/
+  const paths = ["p", "reel"];
+  let html = null;
 
-  const html = await res.text();
-  const videoUrl = extractMeta(html, "og:video");
-  const imageUrl = extractMeta(html, "og:image");
+  for (const p of paths) {
+    const embedUrl = `https://www.instagram.com/${p}/${shortcode}/embed/captioned/`;
+    const res = await fetch(embedUrl, {
+      headers: { "User-Agent": UA_WEB, "Accept-Language": "en-US,en;q=0.9" },
+    });
+    if (res.ok) {
+      html = await res.text();
+      break;
+    }
+  }
+
+  if (!html) throw new Error("instagram embed page unreachable");
+
   const title = extractMeta(html, "og:title");
   const description = extractMeta(html, "og:description");
+
+  // Reels usually don't expose og:video — pull the actual video URL from the
+  // embedded JSON blob Instagram ships inside the page instead.
+  let videoUrl = extractMeta(html, "og:video");
+  let imageUrl = extractMeta(html, "og:image");
+
+  if (!videoUrl) {
+    videoUrl = extractFromJsonBlob(html, "video_url");
+  }
+  if (!imageUrl) {
+    imageUrl =
+      extractFromJsonBlob(html, "display_url") ||
+      extractFromJsonBlob(html, "thumbnail_src");
+  }
 
   if (!videoUrl && !imageUrl) throw new Error("media not found or private/removed");
 
@@ -192,6 +214,19 @@ async function scrapeEmbed(shortcode) {
     title: title || null,
     caption: description || null,
   };
+}
+
+function extractFromJsonBlob(html, key) {
+  // Matches "key":"https:\/\/...some-escaped-url..." anywhere in inline JSON/script tags
+  const regex = new RegExp(`"${key}"\\s*:\\s*"([^"]+)"`, "i");
+  const match = html.match(regex);
+  if (!match) return null;
+  try {
+    // The value is JSON-string-escaped (e.g. \u0026, \/) — decode it properly
+    return JSON.parse(`"${match[1]}"`);
+  } catch {
+    return match[1].replace(/\\\//g, "/").replace(/\\u0026/g, "&");
+  }
 }
 
 function extractMeta(html, property) {
