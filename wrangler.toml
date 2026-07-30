@@ -1,7 +1,0 @@
-name = "ig-download-api"
-main = "src/index.js"
-compatibility_date = "2024-11-01"
-
-# Secrets (set these via GitHub Actions secrets, NOT here):
-# IG_SESSION_COOKIE  -> optional, enables session-based fetching (stories, carousels, private access)
-
