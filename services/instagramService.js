@@ -2,6 +2,13 @@ const axios = require("axios");
 const cheerio = require("cheerio");
 const FormData = require("form-data");
 
+const IG_URL_REGEX = /instagram\.com\/(p|reel|tv|reels)\/[A-Za-z0-9_-]+/i;
+
+// =========================================================================
+// METHOD 1 (fast path): direct POST + manual decode.
+// Works only when Cloudflare does NOT challenge the request.
+// =========================================================================
+
 const HEADERS = {
   "User-Agent":
     "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Mobile Safari/537.36",
@@ -10,10 +17,6 @@ const HEADERS = {
   Origin: "https://snapsave.app",
   Referer: "https://snapsave.app/download-instagram",
 };
-
-const IG_URL_REGEX = /instagram\.com\/(p|reel|tv|reels)\/[A-Za-z0-9_-]+/i;
-
-// ---------- Decoding snapsave.app's obfuscated response ----------
 
 function baseConvert(str, fromBase, toBase) {
   const alphabet =
@@ -53,9 +56,7 @@ function extractEncodedArgs(raw) {
 function decodeSnapSaveResponse(raw) {
   const args = extractEncodedArgs(raw);
   if (!args || args.length < 4) {
-    throw new Error(
-      `could not locate encoded payload in response. raw_preview="${raw.slice(0, 300)}"`
-    );
+    throw new Error("could not locate encoded payload (likely Cloudflare challenge page)");
   }
 
   const [h, uStr, nStr, tStr] = args;
@@ -63,12 +64,8 @@ function decodeSnapSaveResponse(raw) {
   const n = parseInt(nStr, 10);
   const t = parseInt(tStr, 10);
 
-  // Debug guard: if any numeric arg failed to parse, stop here and report
-  // exactly what was extracted instead of silently producing garbage output.
   if (Number.isNaN(u) || Number.isNaN(n) || Number.isNaN(t) || t <= 0) {
-    throw new Error(
-      `bad decode args — h_len=${h?.length}, u="${uStr}", n="${nStr}", t="${tStr}", all_args=${JSON.stringify(args)}`
-    );
+    throw new Error("bad decode args (likely Cloudflare challenge page, not real response)");
   }
 
   let decoded = "";
@@ -85,10 +82,7 @@ function extractDownloadHtml(decoded) {
   const startMarker = 'getElementById("download-section").innerHTML = "';
   const startIdx = decoded.indexOf(startMarker);
   if (startIdx === -1) {
-    const preview = decoded.slice(0, 400);
-    throw new Error(
-      `download-section marker not found. decoded_preview="${preview}"`
-    );
+    throw new Error("download-section marker not found in decoded payload");
   }
 
   const afterStart = decoded.slice(startIdx + startMarker.length);
@@ -103,8 +97,6 @@ function extractDownloadHtml(decoded) {
     .replace(/\\/g, "");
 }
 
-// ---------- Parsing the final HTML for media links ----------
-
 function parseMediaFromHtml(html) {
   const $ = cheerio.load(html);
   const media = [];
@@ -118,11 +110,7 @@ function parseMediaFromHtml(html) {
     const isVideo = /\.mp4|video/i.test(href) || text.includes("video");
     seen.add(href);
 
-    media.push({
-      type: isVideo ? "video" : "image",
-      url: href,
-      quality: text.trim() || null,
-    });
+    media.push({ type: isVideo ? "video" : "image", url: href, quality: text.trim() || null });
   });
 
   if (media.length === 0) {
@@ -143,11 +131,91 @@ function parseMediaFromHtml(html) {
   }
 
   const description =
-    $("span.video-des").text().trim() ||
-    $(".content p").first().text().trim() ||
-    null;
+    $("span.video-des").text().trim() || $(".content p").first().text().trim() || null;
 
   return { description, media };
+}
+
+async function fetchViaDirectRequest(url) {
+  const form = new FormData();
+  form.append("url", url);
+
+  const res = await axios.post("https://snapsave.app/action.php?lang=en", form, {
+    headers: { ...HEADERS, ...form.getHeaders() },
+    timeout: 15000,
+  });
+
+  const decoded = decodeSnapSaveResponse(res.data);
+  const html = extractDownloadHtml(decoded);
+  return parseMediaFromHtml(html);
+}
+
+// =========================================================================
+// METHOD 2 (fallback): real headless browser.
+// Lets an actual Chromium instance load the page, pass any Cloudflare
+// JS-challenge naturally (since it behaves like a real browser), submit
+// the form, and read the rendered #download-section directly from the DOM.
+// Will NOT reliably pass an interactive captcha/Turnstile challenge —
+// only automatic "checking your browser" style JS challenges.
+// =========================================================================
+
+async function fetchViaHeadlessBrowser(url) {
+  const chromium = require("@sparticuz/chromium");
+  const puppeteer = require("puppeteer-core");
+
+  let browser;
+  try {
+    browser = await puppeteer.launch({
+      args: chromium.args,
+      defaultViewport: chromium.defaultViewport,
+      executablePath: await chromium.executablePath(),
+      headless: chromium.headless,
+    });
+
+    const page = await browser.newPage();
+    await page.setUserAgent(
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36"
+    );
+
+    await page.goto("https://snapsave.app/download-instagram", {
+      waitUntil: "networkidle2",
+      timeout: 30000,
+    });
+
+    // Wait for the actual input form to appear — this naturally waits out
+    // a "checking your browser" style Cloudflare JS challenge, if present.
+    await page.waitForSelector('input[name="url"]', { timeout: 20000 });
+
+    await page.type('input[name="url"]', url, { delay: 20 });
+
+    await Promise.all([
+      page.click('button[type="submit"], form button'),
+      page
+        .waitForFunction(
+          () => {
+            const el = document.getElementById("download-section");
+            return el && el.innerHTML.trim().length > 0;
+          },
+          { timeout: 25000 }
+        )
+        .catch(() => null),
+    ]);
+
+    const html = await page.evaluate(() => {
+      const el = document.getElementById("download-section");
+      return el ? el.innerHTML : "";
+    });
+
+    if (!html) {
+      throw new Error(
+        "download-section stayed empty — page may still be behind an interactive Cloudflare challenge/captcha"
+      );
+    }
+
+    return parseMediaFromHtml(html);
+  } finally {
+    if (browser) await browser.close();
+  }
 }
 
 // ---------- Main entry point ----------
@@ -158,44 +226,43 @@ async function fetchInstagramMedia(url) {
   }
 
   if (!IG_URL_REGEX.test(url)) {
-    return {
-      success: false,
-      error: "URL does not look like an Instagram post/reel/tv link",
-    };
+    return { success: false, error: "URL does not look like an Instagram post/reel/tv link" };
   }
 
+  const errors = [];
+  let result;
+
+  // Try the cheap, fast method first.
   try {
-    const form = new FormData();
-    form.append("url", url);
+    result = await fetchViaDirectRequest(url);
+  } catch (e) {
+    errors.push(`direct_request: ${e.message}`);
+  }
 
-    const res = await axios.post(
-      "https://snapsave.app/action.php?lang=en",
-      form,
-      {
-        headers: { ...HEADERS, ...form.getHeaders() },
-        timeout: 15000,
-      }
-    );
-
-    const decoded = decodeSnapSaveResponse(res.data);
-    const html = extractDownloadHtml(decoded);
-    const { description, media } = parseMediaFromHtml(html);
-
-    if (!media.length) {
-      return {
-        success: false,
-        error:
-          "No downloadable media found — post may be private, removed, or unsupported",
-      };
+  // Fall back to a real browser if the fast path failed or found nothing.
+  if (!result || !result.media?.length) {
+    try {
+      result = await fetchViaHeadlessBrowser(url);
+    } catch (e) {
+      errors.push(`headless_browser: ${e.message}`);
     }
+  }
 
-    return { success: true, url, description, count: media.length, media };
-  } catch (err) {
+  if (!result || !result.media?.length) {
     return {
       success: false,
-      error: "Error fetching media: " + (err?.message || String(err)),
+      error: "No downloadable media found",
+      detail: errors,
     };
   }
+
+  return {
+    success: true,
+    url,
+    description: result.description,
+    count: result.media.length,
+    media: result.media,
+  };
 }
 
 module.exports = { fetchInstagramMedia };
