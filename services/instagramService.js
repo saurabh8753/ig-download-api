@@ -78,7 +78,12 @@ function extractDownloadHtml(decoded) {
   const startMarker = 'getElementById("download-section").innerHTML = "';
   const startIdx = decoded.indexOf(startMarker);
   if (startIdx === -1) {
-    throw new Error("download-section not found in decoded payload");
+    // Debug aid: show a preview of what we actually decoded so the real
+    // marker/format can be identified instead of guessing blind.
+    const preview = decoded.slice(0, 400);
+    throw new Error(
+      `download-section marker not found. decoded_preview="${preview}"`
+    );
   }
 
   const afterStart = decoded.slice(startIdx + startMarker.length);
