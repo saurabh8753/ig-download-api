@@ -98,23 +98,78 @@ async function handlePost(url, env) {
 
   let result;
   const cookie = env.IG_SESSION_COOKIE;
+  const errors = [];
 
   if (cookie) {
-    // Prefer session-based (handles carousels + private, if account has access)
     try {
       const mediaId = shortcodeToMediaId(shortcode);
       result = await getMediaInfo(mediaId, cookie);
     } catch (e) {
-      result = await scrapeEmbed(shortcode); // fallback
+      errors.push(`session: ${e.message}`);
     }
-  } else {
-    result = await scrapeEmbed(shortcode);
+  }
+
+  if (!result) {
+    try {
+      result = await fetchAnonymousWebApi(shortcode);
+    } catch (e) {
+      errors.push(`anon_web_api: ${e.message}`);
+    }
+  }
+
+  if (!result) {
+    try {
+      result = await scrapeEmbed(shortcode);
+    } catch (e) {
+      errors.push(`embed: ${e.message}`);
+    }
+  }
+
+  if (!result) {
+    return jsonResponse(
+      { error: "all methods failed", detail: errors, note: "post may be private, removed, or Instagram is blocking this Worker's IP range" },
+      502
+    );
   }
 
   const response = jsonResponse(result, 200);
   response.headers.set("Cache-Control", "public, max-age=300");
   await cache.put(cacheKey, response.clone());
   return response;
+}
+
+// Anonymous method: grab a fresh csrftoken (no login), then call IG's own
+// web-facing API the same way a logged-out browser viewing instagram.com would.
+async function fetchAnonymousWebApi(shortcode) {
+  const homeRes = await fetch("https://www.instagram.com/", {
+    headers: { "User-Agent": UA_WEB },
+  });
+  const setCookie = homeRes.headers.get("set-cookie") || "";
+  const csrfMatch = setCookie.match(/csrftoken=([^;]+)/);
+  const csrfToken = csrfMatch ? csrfMatch[1] : null;
+
+  if (!csrfToken) throw new Error("could not obtain anonymous csrftoken");
+
+  const res = await fetch(
+    `https://www.instagram.com/p/${shortcode}/?__a=1&__d=dis`,
+    {
+      headers: {
+        "User-Agent": UA_WEB,
+        "x-ig-app-id": IG_APP_ID,
+        "x-csrftoken": csrfToken,
+        Cookie: `csrftoken=${csrfToken}`,
+        Accept: "*/*",
+      },
+    }
+  );
+
+  if (!res.ok) throw new Error(`web api responded with ${res.status}`);
+
+  const data = await res.json();
+  const item = data?.items?.[0] ?? data?.graphql?.shortcode_media;
+  if (!item) throw new Error("no media item in response");
+
+  return formatItem(item);
 }
 
 function extractShortcode(url) {
@@ -146,6 +201,11 @@ async function getMediaInfo(mediaId, cookie) {
 }
 
 function formatItem(item) {
+  // Normalize GraphQL shape (shortcode_media) to look like private-API shape
+  if (item.shortcode !== undefined && item.__typename) {
+    return formatGraphqlItem(item);
+  }
+
   if (item.media_type === 8 && Array.isArray(item.carousel_media)) {
     return {
       id: item.id,
@@ -156,6 +216,29 @@ function formatItem(item) {
     };
   }
   return { id: item.id, caption: item.caption?.text ?? null, ...formatSingle(item) };
+}
+
+function formatGraphqlItem(item) {
+  if (item.edge_sidecar_to_children?.edges?.length) {
+    return {
+      id: item.id,
+      type: "carousel",
+      caption: item.edge_media_to_caption?.edges?.[0]?.node?.text ?? null,
+      count: item.edge_sidecar_to_children.edges.length,
+      items: item.edge_sidecar_to_children.edges.map((e) => ({
+        type: e.node.is_video ? "video" : "image",
+        media_url: e.node.is_video ? e.node.video_url : e.node.display_url,
+        thumbnail_url: e.node.display_url ?? null,
+      })),
+    };
+  }
+  return {
+    id: item.id,
+    caption: item.edge_media_to_caption?.edges?.[0]?.node?.text ?? null,
+    type: item.is_video ? "video" : "image",
+    media_url: item.is_video ? item.video_url : item.display_url,
+    thumbnail_url: item.display_url ?? null,
+  };
 }
 
 function formatSingle(item) {
