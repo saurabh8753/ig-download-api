@@ -15,7 +15,6 @@ const IG_URL_REGEX = /instagram\.com\/(p|reel|tv|reels)\/[A-Za-z0-9_-]+/i;
 
 // ---------- Decoding snapsave.app's obfuscated response ----------
 
-// Converts a numeric string between two custom alphabets (base "fromBase" -> base "toBase")
 function baseConvert(str, fromBase, toBase) {
   const alphabet =
     "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ+/".split("");
@@ -38,8 +37,6 @@ function baseConvert(str, fromBase, toBase) {
   return result || "0";
 }
 
-// Pulls the [h, u, n, t, e, r] arguments out of the eval(...) wrapper
-// without ever executing the remote script.
 function extractEncodedArgs(raw) {
   const marker = "decodeURIComponent(escape(r))}(";
   const startIdx = raw.indexOf(marker);
@@ -56,13 +53,23 @@ function extractEncodedArgs(raw) {
 function decodeSnapSaveResponse(raw) {
   const args = extractEncodedArgs(raw);
   if (!args || args.length < 4) {
-    throw new Error("could not locate encoded payload in response");
+    throw new Error(
+      `could not locate encoded payload in response. raw_preview="${raw.slice(0, 300)}"`
+    );
   }
 
   const [h, uStr, nStr, tStr] = args;
   const u = parseInt(uStr, 10);
   const n = parseInt(nStr, 10);
   const t = parseInt(tStr, 10);
+
+  // Debug guard: if any numeric arg failed to parse, stop here and report
+  // exactly what was extracted instead of silently producing garbage output.
+  if (Number.isNaN(u) || Number.isNaN(n) || Number.isNaN(t) || t <= 0) {
+    throw new Error(
+      `bad decode args — h_len=${h?.length}, u="${uStr}", n="${nStr}", t="${tStr}", all_args=${JSON.stringify(args)}`
+    );
+  }
 
   let decoded = "";
   for (let i = 0; i < h.length; i += t) {
@@ -78,8 +85,6 @@ function extractDownloadHtml(decoded) {
   const startMarker = 'getElementById("download-section").innerHTML = "';
   const startIdx = decoded.indexOf(startMarker);
   if (startIdx === -1) {
-    // Debug aid: show a preview of what we actually decoded so the real
-    // marker/format can be identified instead of guessing blind.
     const preview = decoded.slice(0, 400);
     throw new Error(
       `download-section marker not found. decoded_preview="${preview}"`
